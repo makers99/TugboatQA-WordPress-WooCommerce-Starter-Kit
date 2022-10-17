@@ -1,0 +1,126 @@
+services:
+  mysql:
+    image: tugboatqa/mysql:5
+    commands:
+      init:
+        - mysql -e "SET GLOBAL innodb_buffer_pool_size = ${DB_BUFFER_POOL_SIZE:-512} * 1024 * 1024"
+
+  php:
+    image: tugboatqa/php:8-apache
+    default: true
+    depends:
+      - mysql
+    commands:
+      init:
+        - cd ${TUGBOAT_ROOT}
+        # Install PHP extensions.
+        - |
+          apt-get update
+          apt-get install -y libxml2-dev
+          docker-php-ext-install opcache mysqli
+        # Configure PHP.
+        - |
+          cat >> /usr/local/etc/php/conf.d/wordpress.ini <<INI
+          memory_limit = 512M
+          post_max_size = 128M
+          upload_max_filesize = 128M
+          INI
+        - |
+          cat >> /usr/local/etc/php/conf.d/opcache.ini <<INI
+          [opcache]
+          opcache.enable=1
+          opcache.enable_cli=0
+          opcache.interned_strings_buffer=16
+          opcache.jit_buffer_size=50M
+          opcache.jit=tracing
+          opcache.memory_consumption=128
+          opcache.max_accelerated_files=8000
+          opcache.fast_shutdown=1
+          INI
+        - wget -O opcache.php https://raw.githubusercontent.com/amnuts/opcache-gui/master/index.php
+        # Install Apache modules.
+        - a2enmod rewrite headers
+        # Install nodejs via nvm.
+        - |
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash
+          . ~/.nvm/nvm.sh
+          nvm install
+        # Install wp-cli.
+        - curl https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp
+        - chmod +x /usr/local/bin/wp
+        # Set up virtual host.
+        - ln -snf "${TUGBOAT_ROOT}" "${DOCROOT}"
+        - |
+          htpasswd -cb .htpasswd ${HTTP_BASIC_USERNAME:-user} ${HTTP_BASIC_PASSWORD:-pass}
+          printf "<Directory $DOCROOT>\nAuthType Basic\nAuthName Preview\nAuthUserFile $DOCROOT/.htpasswd\nRequire valid-user\n</Directory>\n" > /etc/apache2/conf-enabled/htpasswd.conf
+          printf "<Directory $DOCROOT>\nOptions +FollowSymLinks\nAllowOverride All\n</Directory>\n" > /etc/apache2/conf-enabled/symlinks-core-standards.conf
+          service apache2 reload
+
+        # Set up application.
+        - |
+          . ~/.nvm/nvm.sh
+          npm install --global gulp-cli
+        - git submodule update --init
+        - |
+          wp --allow-root config create --skip-check --force --dbname=tugboat --dbuser=tugboat --dbpass=tugboat --dbhost=mysql --dbcharset=utf8mb4 --extra-php <<PHP
+          # Domain
+          const WP_SITEURL = 'https://${TUGBOAT_SERVICE_URL_HOST}';
+          const WP_HOME = WP_SITEURL;
+
+          # Plugin settings
+
+          # Enrichment/integration services
+          const EP_HOST = '${ELASTICPRESS_HOST}';
+          const ES_SHIELD = '${ELASTICPRESS_SHIELD}';
+          const WP_REDIS_DISABLED = TRUE;
+
+          # Automations
+          const DISABLE_WP_CRON = TRUE;
+          const AUTOMATIC_UPDATER_DISABLED = TRUE;
+          const WP_AUTO_UPDATE_CORE = FALSE;
+          const DISALLOW_FILE_MODS = TRUE;
+
+          # Environment settings
+          const FS_METHOD = 'direct';
+          const WP_DEBUG = FALSE;
+          const WP_DEBUG_LOG = TRUE;
+          PHP
+
+        # Clean up disk space.
+        - apt-get clean -y
+        - rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+        # Import database dump from remote server.
+        - |
+          mkdir -p ~/.ssh
+          cat >> ~/.ssh/config <<END
+          Host stage
+            Hostname ${SSH_HOSTNAME}
+            Port ${SSH_PORT:-22}
+            User ${SSH_USER:-stage}
+          END
+        - |
+          ssh stage "[[ -f clean.sql ]] || { cd htdocs; wp db export-clean ~/clean.sql; }"
+          scp -C stage:clean.sql .
+          wp --allow-root db import clean.sql
+          rm clean.sql
+
+      build:
+        # Install dependencies and build project.
+        - git submodule update --init
+        - |
+          . ~/.nvm/nvm.sh
+          npm run setup:production
+          npm run setup-dirs www-data
+
+        # Update site URL.
+        - |
+          sed -i -e"s/const WP_SITEURL = .*\;/const WP_SITEURL = 'https:\/\/${TUGBOAT_SERVICE_URL_HOST}';/" wp-config.php
+          SHELL_PIPE=0 wp --allow-root search-replace "${WEB_REPLACE_DOMAIN:-example.com}" "${TUGBOAT_SERVICE_URL_HOST}" --all-tables --report-changed-only --skip-columns=guid,user_email,comment_author_email,display_meta,domain,referrer
+
+        # Install plugins for QA.
+        - wp --allow-root plugin install --activate query-monitor
+
+        # Clean up disk space.
+        - rm -rf node_modules ${DOCROOT}/wp-content/themes/*/node_modules
+        - rm -rf /tmp/* /var/tmp/*
